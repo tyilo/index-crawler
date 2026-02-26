@@ -15,7 +15,11 @@ use mime::{Mime, TEXT_HTML};
 use reqwest::{Url, header::CONTENT_TYPE};
 use reqwest_extra::ResponseExt;
 use scraper::{Html, Selector};
-use tokio::{io::AsyncWriteExt, sync::mpsc, task::JoinHandle};
+use tokio::{
+    io::AsyncWriteExt,
+    sync::{Semaphore, mpsc},
+    task::JoinHandle,
+};
 
 struct RunOnDrop<F: FnMut()>(F);
 
@@ -34,12 +38,18 @@ struct Crawler {
     visited_paths: Mutex<HashSet<PathBuf>>,
     multi_progress: MultiProgress,
     main_progress: ProgressBar,
+    semaphore: Semaphore,
 }
 
 type TX = mpsc::UnboundedSender<JoinHandle<()>>;
 
 impl Crawler {
-    fn new(start_url: Url, out_dir: PathBuf, no_save_files: bool) -> Result<Self> {
+    fn new(
+        start_url: Url,
+        out_dir: PathBuf,
+        max_concurrent_requests: usize,
+        no_save_files: bool,
+    ) -> Result<Self> {
         let multi_progress = MultiProgress::new();
         let main_progress = multi_progress.add(
             ProgressBar::new(0)
@@ -61,6 +71,7 @@ impl Crawler {
             visited_paths: Mutex::new(HashSet::new()),
             multi_progress,
             main_progress,
+            semaphore: Semaphore::new(max_concurrent_requests),
         })
     }
 
@@ -109,6 +120,8 @@ impl Crawler {
         if !self.visited_paths.lock().unwrap().insert(path.clone()) {
             return Ok(());
         }
+
+        let _permit = self.semaphore.acquire().await?;
 
         self.main_progress.inc_length(1);
         let _defer = RunOnDrop(|| {
@@ -201,6 +214,8 @@ struct Cli {
     out_dir: Option<PathBuf>,
     #[clap(long)]
     no_save_files: bool,
+    #[clap(long, default_value_t = 10)]
+    max_concurrent_requests: usize,
 }
 
 #[tokio::main]
@@ -211,7 +226,12 @@ async fn main() -> Result<()> {
     // See https://github.com/clap-rs/clap/issues/4746
     let out_dir = args.out_dir.unwrap_or_default();
 
-    let crawler = Arc::new(Crawler::new(args.url.clone(), out_dir, args.no_save_files)?);
+    let crawler = Arc::new(Crawler::new(
+        args.url.clone(),
+        out_dir,
+        args.max_concurrent_requests,
+        args.no_save_files,
+    )?);
     crawler.crawl().await;
 
     Ok(())
