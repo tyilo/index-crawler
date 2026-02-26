@@ -121,12 +121,12 @@ impl Crawler {
             return Ok(());
         }
 
-        let _permit = self.semaphore.acquire().await?;
-
         self.main_progress.inc_length(1);
         let _defer = RunOnDrop(|| {
             self.main_progress.inc(1);
         });
+
+        let _permit = self.semaphore.acquire().await?;
 
         self.main_progress.println(format!("Downloading {url}"));
 
