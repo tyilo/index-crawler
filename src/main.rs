@@ -2,16 +2,20 @@
 
 use std::{
     collections::HashSet,
+    ffi::OsString,
+    os::unix::ffi::{OsStrExt, OsStringExt},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::Duration,
 };
 
+use bstr::ByteSlice;
 use clap::Parser;
 use color_eyre::Result;
 use futures_lite::StreamExt;
 use indicatif::{MultiProgress, ProgressBar, ProgressFinish, ProgressStyle};
 use mime::{Mime, TEXT_HTML};
+use percent_encoding::percent_decode_str;
 use reqwest::{Url, header::CONTENT_TYPE};
 use reqwest_extra::ResponseExt;
 use scraper::{Html, Selector};
@@ -96,7 +100,8 @@ impl Crawler {
         if relative.starts_with("..") {
             return None;
         }
-        Some(PathBuf::from(relative))
+        let bytes: Vec<u8> = percent_decode_str(&relative).collect();
+        Some(OsString::from_vec(bytes).into())
     }
 
     // Using `async fn` doesn't work as Rust can't figure out that the future is
@@ -177,8 +182,10 @@ impl Crawler {
                     pb.inc(chunk.len().try_into().unwrap());
                 }
             }
-            self.main_progress
-                .println(format!("Saved file {}", file_path.display()));
+            self.main_progress.println(format!(
+                "Saved file {:?}",
+                file_path.as_os_str().as_bytes().as_bstr()
+            ));
             return Ok(());
         }
 

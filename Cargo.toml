@@ -13,3 +13,5 @@ scraper = "0.25.0"
 tokio = { version = "1.49.0", features = ["full"] }
 mime = "0.3.17"
 futures-lite = "2.6.1"
+percent-encoding = "2.3.2"
+bstr = "1.12.1"
