@@ -5,7 +5,7 @@ use std::{
     ffi::OsString,
     os::unix::ffi::{OsStrExt, OsStringExt},
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::Duration,
 };
 
@@ -22,7 +22,6 @@ use scraper::{Html, Selector};
 use tokio::{
     io::AsyncWriteExt,
     sync::{Semaphore, mpsc},
-    task::JoinHandle,
 };
 
 struct RunOnDrop<F: FnMut()>(F);
@@ -39,13 +38,13 @@ struct Crawler {
     out_dir: PathBuf,
     no_save_files: bool,
     link_selector: Selector,
-    visited_paths: Mutex<HashSet<PathBuf>>,
     multi_progress: MultiProgress,
     main_progress: ProgressBar,
     semaphore: Semaphore,
 }
 
-type TX = mpsc::UnboundedSender<JoinHandle<()>>;
+#[derive(Clone)]
+struct Tx(mpsc::UnboundedSender<(Url, Tx)>);
 
 impl Crawler {
     fn new(
@@ -72,7 +71,6 @@ impl Crawler {
             out_dir,
             no_save_files,
             link_selector: Selector::parse("a[href]").unwrap(),
-            visited_paths: Mutex::new(HashSet::new()),
             multi_progress,
             main_progress,
             semaphore: Semaphore::new(max_concurrent_requests),
@@ -81,13 +79,35 @@ impl Crawler {
 
     async fn crawl(self: Arc<Self>) {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        self.crawl_url(&self.start_url, &tx).await;
-        drop(tx);
+        self.crawl_url(
+            &self.start_url,
+            self.path(&self.start_url).unwrap(),
+            &Tx(tx),
+        )
+        .await;
 
-        while let Some(handle) = rx.recv().await {
-            if let Err(e) = handle.await {
+        let mut visited_paths = HashSet::new();
+        let mut tasks = vec![];
+        while let Some((url, tx)) = rx.recv().await {
+            let Some(path) = self.path(&url) else {
+                self.main_progress.println(format!("Skipping {url}"));
+                continue;
+            };
+
+            if !visited_paths.insert(path.clone()) {
+                continue;
+            }
+
+            let this = self.clone();
+            tasks.push(tokio::task::spawn(async move {
+                this.crawl_url(&url, path, &tx).await;
+            }));
+        }
+
+        for task in tasks {
+            if let Err(e) = task.await {
                 self.main_progress
-                    .println(format!("Failed to join task: {e}"));
+                    .println(format!("Failed to join task: {e:?}"));
             }
         }
     }
@@ -107,25 +127,21 @@ impl Crawler {
     // Using `async fn` doesn't work as Rust can't figure out that the future is
     // actually `Send`
     #[allow(clippy::manual_async_fn)]
-    fn crawl_url(self: &Arc<Self>, url: &Url, tx: &TX) -> impl Future<Output = ()> + Send {
+    fn crawl_url(
+        self: &Arc<Self>,
+        url: &Url,
+        path: PathBuf,
+        tx: &Tx,
+    ) -> impl Future<Output = ()> + Send {
         async move {
-            if let Err(e) = self.crawl_url_inner(url, tx).await {
+            if let Err(e) = self.crawl_url_inner(url, path, tx).await {
                 self.main_progress
                     .println(format!("Failed to crawl {url}: {e:?}"));
             }
         }
     }
 
-    async fn crawl_url_inner(self: &Arc<Self>, url: &Url, tx: &TX) -> Result<()> {
-        let Some(path) = self.path(url) else {
-            self.main_progress.println(format!("Skipping {url}"));
-            return Ok(());
-        };
-
-        if !self.visited_paths.lock().unwrap().insert(path.clone()) {
-            return Ok(());
-        }
-
+    async fn crawl_url_inner(self: &Arc<Self>, url: &Url, path: PathBuf, tx: &Tx) -> Result<()> {
         self.main_progress.inc_length(1);
         let _defer = RunOnDrop(|| {
             self.main_progress.inc(1);
@@ -198,11 +214,7 @@ impl Crawler {
             };
             match url.join(href) {
                 Ok(url) => {
-                    let this = self.clone();
-                    tx.send({
-                        let tx = tx.clone();
-                        tokio::task::spawn(async move { this.crawl_url(&url, &tx).await })
-                    })?;
+                    tx.0.send((url, tx.clone()))?;
                 }
                 Err(e) => self.main_progress.println(format!(
                     "Failed to parse href value {href:?} on page {url}: {e}"
